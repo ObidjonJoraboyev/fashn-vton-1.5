@@ -12,12 +12,14 @@ from fashn_human_parser import CATEGORY_TO_BODY_COVERAGE, FashnHumanParser
 from PIL import Image
 from tqdm.auto import tqdm
 
+from . import postprocess
 from .dwpose import DWposeDetector, draw_pose
 from .preprocessing import (
     BODY_COVERAGE_TO_FASHN_LABELS,
     FASHN_LABELS_TO_IDS,
     AspectPreserveResize,
     ResizePad,
+    compute_clothing_agnostic_mask,
     create_clothing_agnostic_image,
     create_garment_image,
 )
@@ -38,6 +40,9 @@ class PipelineOutput:
     """Pipeline output container."""
 
     images: List[Image.Image]
+    # Garment-fidelity ranking scores, same order as `images` (best first).
+    # Only populated when num_samples > 1; None for single-sample calls.
+    scores: Optional[List[float]] = None
 
 
 class TryOnPipeline:
@@ -88,6 +93,107 @@ class TryOnPipeline:
         max_dim = max(h, w)
         self.pre_resize = AspectPreserveResize(target_size=(max_dim, max_dim), mode="fit", backend="pil")
         self.resize_pad_fn = ResizePad((w, h), backend="opencv")
+
+    def _label_indices_for_category(self, category: str) -> List[int]:
+        """Garment-region label indices associated with a try-on category."""
+        body_coverage = CATEGORY_TO_BODY_COVERAGE.get(category)
+        labels = BODY_COVERAGE_TO_FASHN_LABELS.get(body_coverage, [])
+        return [FASHN_LABELS_TO_IDS[label] for label in labels]
+
+    def _check_category_match(
+        self,
+        garment_seg_pred: np.ndarray,
+        category: str,
+        min_confidence: float = 0.08,
+        strict: bool = False,
+    ) -> None:
+        """
+        Sanity-check that the garment image actually looks like the requested category.
+
+        Compares pixel coverage of each category's associated labels in the garment
+        image's own segmentation and warns (or raises, if `strict`) when a different
+        category is clearly more dominant than the one requested.
+        """
+        coverage_by_category = {}
+        for candidate in self.CATEGORY_TO_LABEL:
+            indices = self._label_indices_for_category(candidate)
+            if indices:
+                coverage_by_category[candidate] = float(np.isin(garment_seg_pred, indices).mean())
+
+        if not coverage_by_category:
+            return
+
+        best_category = max(coverage_by_category, key=coverage_by_category.get)
+        best_coverage = coverage_by_category[best_category]
+
+        if best_coverage < min_confidence or best_category == category:
+            return
+
+        msg = (
+            f"Garment image looks like '{best_category}' ({best_coverage:.0%} of pixels match) "
+            f"but category='{category}' was requested. Results may be degraded — "
+            "double check the category or crop the garment image more tightly."
+        )
+        if strict:
+            raise ValueError(msg)
+        self.logger.warning(msg)
+
+    def _validate_inputs(
+        self,
+        person_image_np: np.ndarray,
+        person_pose: dict,
+        person_seg_pred: np.ndarray,
+        category: str,
+        min_resolution: int = 256,
+        min_keypoints: int = 8,
+        strict: bool = False,
+    ) -> None:
+        """
+        Catch garbage-in-garbage-out cases before spending a full sampling pass:
+        too-low resolution, no detectable person, or a photo that doesn't actually
+        show the body region the requested category needs (e.g. a half-body crop
+        with category="bottoms").
+        """
+        h, w = person_image_np.shape[:2]
+        if min(h, w) < min_resolution:
+            self.logger.warning(
+                f"person_image is low resolution ({w}x{h}); results may be degraded. "
+                f"Recommended minimum: {min_resolution}px on the shorter side."
+            )
+
+        subset = person_pose["bodies"]["subset"]
+        visible_keypoints = int(np.sum(subset[:, :18] != -1))
+        if visible_keypoints == 0:
+            msg = "No person detected in person_image (zero visible pose keypoints)."
+            if strict:
+                raise ValueError(msg)
+            self.logger.warning(msg)
+        elif visible_keypoints < min_keypoints:
+            self.logger.warning(
+                f"Low pose confidence: only {visible_keypoints}/18 body keypoints detected. "
+                "Use a clearer, front-facing, well-lit, single-person photo for best results."
+            )
+
+        body_coverage = CATEGORY_TO_BODY_COVERAGE.get(category)
+        required_labels = {
+            "upper": ["torso", "arms"],
+            "lower": ["legs"],
+            "full": ["torso", "arms", "legs"],
+        }.get(body_coverage, [])
+
+        for label in required_labels:
+            label_id = FASHN_LABELS_TO_IDS.get(label)
+            if label_id is None:
+                continue
+            coverage = float(np.mean(person_seg_pred == label_id))
+            if coverage < 0.01:
+                msg = (
+                    f"category='{category}' needs a visible '{label}', but person_image shows "
+                    f"almost none ({coverage:.1%}). Photo may be cropped too tightly."
+                )
+                if strict:
+                    raise ValueError(msg)
+                self.logger.warning(msg)
 
     def _validate_weights(self):
         """Check that required weight files exist."""
@@ -154,12 +260,25 @@ class TryOnPipeline:
         num_timesteps: int = 30,
         time_shift_mu: float = 1.5,
         guidance_scale: float = 1.5,
+        garment_guidance_scale: Optional[float] = None,
+        person_guidance_scale: Optional[float] = None,
         skip_cfg_last_n_steps: int = 1,
         use_tqdm: bool = True,
     ) -> List[Image.Image]:
-        """Euler sampling with CFG."""
+        """
+        Euler sampling with CFG.
+
+        By default uses the trained/validated joint single-scale CFG. Passing
+        `garment_guidance_scale` and/or `person_guidance_scale` switches to an
+        EXPERIMENTAL decoupled 3-term CFG (see `TryOnModel.forward_for_decoupled_cfg`)
+        that costs ~50% more compute per step (3x batched forward vs. 2x).
+        """
         device, dtype = ca_images.device, ca_images.dtype
         batch_size = ca_images.shape[0]
+
+        decoupled = garment_guidance_scale is not None or person_guidance_scale is not None
+        garment_scale = garment_guidance_scale if garment_guidance_scale is not None else guidance_scale
+        person_scale = person_guidance_scale if person_guidance_scale is not None else guidance_scale
 
         # Init noisy images
         c, h, w = self.tryon_model.channels_in, *self.tryon_model.input_shape
@@ -187,15 +306,23 @@ class TryOnPipeline:
         ):
             dt = t_prev - t_curr
             t_vec = torch.full((batch_size,), t_curr, dtype=dtype, device=device)
+            skip_cfg = skip_cfg_last_n_steps > 0 and step_idx >= num_timesteps - skip_cfg_last_n_steps
 
-            pred = self.tryon_model.forward_for_cfg(images, t_vec, **model_kwargs)
-            v_c, v_u = pred["v_c"], pred["v_u"]
-
-            # Skip CFG at final steps to prevent color saturation
-            if skip_cfg_last_n_steps > 0 and step_idx >= num_timesteps - skip_cfg_last_n_steps:
-                v_guided = v_c
+            if decoupled:
+                pred = self.tryon_model.forward_for_decoupled_cfg(images, t_vec, **model_kwargs)
+                v_null, v_garment, v_full = pred["v_null"], pred["v_garment"], pred["v_full"]
+                if skip_cfg:
+                    v_guided = v_full
+                else:
+                    v_guided = v_null + garment_scale * (v_garment - v_null) + person_scale * (v_full - v_garment)
             else:
-                v_guided = v_u + guidance_scale * (v_c - v_u)
+                pred = self.tryon_model.forward_for_cfg(images, t_vec, **model_kwargs)
+                v_c, v_u = pred["v_c"], pred["v_u"]
+                # Skip CFG at final steps to prevent color saturation
+                if skip_cfg:
+                    v_guided = v_c
+                else:
+                    v_guided = v_u + guidance_scale * (v_c - v_u)
 
             images = images + dt * v_guided
 
@@ -212,9 +339,19 @@ class TryOnPipeline:
         num_samples: int = 1,
         num_timesteps: int = 30,
         guidance_scale: float = 1.5,
+        garment_guidance_scale: Optional[float] = None,
+        person_guidance_scale: Optional[float] = None,
         skip_cfg_last_n_steps: int = 1,
         seed: int = 42,
         segmentation_free: bool = True,
+        validate_inputs: bool = True,
+        strict_validation: bool = False,
+        check_category_match: bool = True,
+        strict_category_check: bool = False,
+        preserve_background: bool = True,
+        restore_resolution: bool = True,
+        sharpen: bool = True,
+        restore_faces: bool = False,
     ) -> PipelineOutput:
         """
         Run virtual try-on inference.
@@ -225,18 +362,54 @@ class TryOnPipeline:
             category: Garment category - "tops", "bottoms", or "one-pieces".
             garment_photo_type: "model" if garment is worn by a person,
                 "flat-lay" for product shots on plain backgrounds.
-            num_samples: Number of output images to generate (1-4).
+            num_samples: Number of output images to generate (1-4). When > 1,
+                outputs are ranked by garment-fidelity score (best first).
             num_timesteps: Diffusion sampling steps. Higher = better quality, slower.
                 Recommended: 20 (fast), 30 (balanced), 50 (quality).
             guidance_scale: Classifier-free guidance strength.
+            garment_guidance_scale: EXPERIMENTAL. If set (with or without
+                person_guidance_scale), switches to a decoupled 3-term CFG that
+                controls garment fidelity (logos/colors/shape) independently from
+                person/pose fidelity, at ~50% extra compute per step. The model was
+                trained with joint conditional dropout only — independently dropping
+                garment vs. person conditioning was never seen during training, so
+                this is an inference-time extrapolation. Validate on real examples
+                before relying on it; omit both scales for the trained/validated
+                joint-CFG default.
+            person_guidance_scale: EXPERIMENTAL, see garment_guidance_scale. Falls
+                back to guidance_scale if unset while garment_guidance_scale is set.
             skip_cfg_last_n_steps: Skip CFG for final N steps to prevent color saturation.
             seed: Random seed for reproducibility.
             segmentation_free: If True, generate without masking the person image.
                 Recommended for better body preservation and unconstrained garment volume
                 (allows garments to expand beyond the original outfit's boundaries).
+            validate_inputs: If True, log warnings for low-resolution images, low pose
+                confidence, or a person photo that doesn't show the body region the
+                requested category needs.
+            strict_validation: If True, raise instead of warn on severe input issues
+                (e.g. no person detected).
+            check_category_match: If True, warn when the garment image's own
+                segmentation suggests a different category than the one requested.
+            strict_category_check: If True, raise instead of warn on a category mismatch.
+            preserve_background: If True, alpha-composite the generated garment region
+                back over the pixel-exact original photo, guaranteeing the background,
+                face, and other untouched regions never drift from the input. Also
+                restores the original input resolution as a side effect.
+            restore_resolution: If True (and preserve_background is False), resize
+                output back to the original input resolution instead of returning it
+                capped at the model's internal working resolution.
+            sharpen: If True, apply a mild unsharp mask to the generated content to
+                counter typical diffusion-model softness.
+            restore_faces: If True, run GFPGAN face restoration on the generated
+                content (requires `pip install fashn-vton[enhance]`; no-ops otherwise).
+                Off by default: it can subtly alter facial features, and is redundant
+                when preserve_background=True since the face is already restored to
+                the exact original pixels during compositing. Mainly useful with
+                preserve_background=False.
 
         Returns:
-            PipelineOutput with `images` list containing generated PIL Images.
+            PipelineOutput with `images` list containing generated PIL Images, and
+            `scores` (garment-fidelity ranking) when num_samples > 1.
         """
         # Set seed
         torch.manual_seed(seed)
@@ -245,6 +418,7 @@ class TryOnPipeline:
         np.random.seed(seed)
 
         # Pre-resize for pose detection quality
+        original_person_image = person_image.convert("RGB")
         person_image = self.pre_resize(person_image, allow_upsampling=False)
         garment_image = self.pre_resize(garment_image, allow_upsampling=False)
 
@@ -266,10 +440,26 @@ class TryOnPipeline:
         person_seg_pred = self.hp_model.predict(person_image_np)
         garment_seg_pred = self.hp_model.predict(garment_image_np)
 
+        if validate_inputs:
+            self._validate_inputs(
+                person_image_np, person_pose, person_seg_pred, category, strict=strict_validation
+            )
+        if check_category_match:
+            self._check_category_match(garment_seg_pred, category, strict=strict_category_check)
+
         # Get labels to segment based on category
         body_coverage = CATEGORY_TO_BODY_COVERAGE.get(category)
         labels_to_segment = BODY_COVERAGE_TO_FASHN_LABELS.get(body_coverage)
         labels_to_segment_indices = [FASHN_LABELS_TO_IDS[label] for label in labels_to_segment]
+
+        # Edit-region mask, computed regardless of `segmentation_free` — used later to
+        # composite the generated output back over the pixel-exact original image.
+        edit_mask = compute_clothing_agnostic_mask(
+            seg_pred=person_seg_pred.copy(),
+            labels_to_segment_indices=labels_to_segment_indices.copy(),
+            body_coverage=body_coverage,
+            logger=self.logger,
+        )
 
         # Create clothing-agnostic and garment images
         ca_image = create_clothing_agnostic_image(
@@ -326,12 +516,57 @@ class TryOnPipeline:
             garment_categories=garment_categories,
             num_timesteps=num_timesteps,
             guidance_scale=guidance_scale,
+            garment_guidance_scale=garment_guidance_scale,
+            person_guidance_scale=person_guidance_scale,
             skip_cfg_last_n_steps=skip_cfg_last_n_steps,
         )
 
         # Unpad outputs
         images = [self.resize_pad_fn.unpad(img) for img in images]
 
+        # Optional GFPGAN face restoration (no-ops if the [enhance] extra isn't installed)
+        if restore_faces:
+            images = [postprocess.restore_face(img) for img in images]
+
+        # Restore original resolution and/or protect background+identity pixels.
+        # Compositing resizes to `original_person_image`'s resolution as a side effect.
+        if preserve_background:
+            images = [
+                postprocess.composite_preserve_background(img, original_person_image, edit_mask)
+                for img in images
+            ]
+        elif restore_resolution:
+            images = [postprocess.resize_to_match(img, original_person_image.size) for img in images]
+
+        # Sharpen only the model-generated content; re-composite so any protected
+        # background pixels stay exactly as they were even after sharpening.
+        if sharpen:
+            sharpened = [postprocess.unsharp_mask(img) for img in images]
+            if preserve_background:
+                images = [
+                    postprocess.composite_preserve_background(s, base, edit_mask)
+                    for s, base in zip(sharpened, images)
+                ]
+            else:
+                images = sharpened
+
+        # Rank multiple samples by garment-fidelity, blended with face-identity
+        # similarity when available (best first). Identity scoring only helps
+        # distinguish samples when preserve_background=False — with the default
+        # preserve_background=True the face is already identical across samples.
+        scores = None
+        if num_samples > 1:
+            garment_scores = [
+                postprocess.score_garment_fidelity(img, garment_image_processed, edit_mask) for img in images
+            ]
+            identity_scores = [postprocess.face_identity_score(img, original_person_image) for img in images]
+            scores = [
+                g if idn is None else 0.5 * g + 0.5 * idn for g, idn in zip(garment_scores, identity_scores)
+            ]
+            order = sorted(range(len(images)), key=lambda i: scores[i], reverse=True)
+            images = [images[i] for i in order]
+            scores = [scores[i] for i in order]
+
         self.logger.info(f"Generated {len(images)} images")
 
-        return PipelineOutput(images=images)
+        return PipelineOutput(images=images, scores=scores)

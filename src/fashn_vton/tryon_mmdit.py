@@ -13,7 +13,7 @@ import torch
 from einops import rearrange, repeat
 from torch import Tensor, nn
 
-from .utils import cast_tuple, compact, exists, unpack_images
+from .utils import cast_tuple, compact, default, exists, unpack_images
 
 
 # Use PyTorch's native scaled dot product attention (SDPA)
@@ -475,6 +475,46 @@ class TryOnModel(nn.Module):
 
         return {"v_c": logits, "v_u": null_logits}
 
+    def forward_for_decoupled_cfg(self, *args, **kwargs):
+        """
+        3-term CFG with independent garment-conditioning and person-conditioning
+        guidance scales, for separately controlling garment fidelity (logos/colors/
+        shape) vs. person/pose fidelity at sampling time.
+
+        EXPERIMENTAL: the model was trained with a single joint conditional-dropout
+        mask — every conditioning signal (garment image/pose/category and person
+        image/pose) was always dropped or kept together, never independently. The
+        "garment conditioned, person dropped" combination this method evaluates was
+        never seen during training, so this is an inference-time extrapolation, not
+        a validated technique. It may help or may introduce artifacts; compare
+        against `forward_for_cfg` (the trained/validated joint CFG) on real examples
+        before trusting it.
+        """
+        kwargs = compact(kwargs)
+
+        noisy_images = args[0]
+        batch_size = noisy_images.shape[0]
+
+        triplicated_args = [
+            torch.cat([arg, arg, arg], dim=0) if isinstance(arg, torch.Tensor) else arg for arg in args
+        ]
+        triplicated_kwargs = {
+            k: torch.cat([v, v, v], dim=0) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()
+        }
+
+        device = noisy_images.device
+        zeros = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        ones = torch.ones(batch_size, device=device, dtype=torch.bool)
+
+        # null: nothing conditioned | garment_only: garment conditioned, person dropped | full: everything conditioned
+        triplicated_kwargs["person_mask"] = torch.cat([zeros, zeros, ones], dim=0)
+        triplicated_kwargs["garment_mask"] = torch.cat([zeros, ones, ones], dim=0)
+
+        all_logits = self.forward(*triplicated_args, **triplicated_kwargs)["x"]
+        v_null, v_garment, v_full = all_logits.split(batch_size)
+
+        return {"v_null": v_null, "v_garment": v_garment, "v_full": v_full}
+
     def forward(
         self,
         x,
@@ -484,6 +524,8 @@ class TryOnModel(nn.Module):
         person_poses,
         garment_poses,
         mask: Optional[torch.Tensor] = None,
+        person_mask: Optional[torch.Tensor] = None,
+        garment_mask: Optional[torch.Tensor] = None,
         guidance: Optional[torch.Tensor] = None,
         garment_categories: Optional[torch.Tensor] = None,
     ):
@@ -495,16 +537,23 @@ class TryOnModel(nn.Module):
         if not exists(mask):
             mask = torch.ones(batch_size, device=device, dtype=torch.bool)
 
+        # Independent dropout for the "person" (ca_image + person_pose) and
+        # "garment" (garment_image + garment_pose + category) conditioning groups.
+        # Both default to the joint `mask`, so passing only `mask` reproduces the
+        # original single-mask behavior exactly (used by `forward_for_cfg`).
+        person_mask = default(person_mask, mask)
+        garment_mask = default(garment_mask, mask)
+
         ####################### 2D IMAGES TO SEQUENCE ########################
 
-        ca_images = apply_conditional_dropout(ca_images, mask)
-        person_poses = apply_conditional_dropout(person_poses, mask)
+        ca_images = apply_conditional_dropout(ca_images, person_mask)
+        person_poses = apply_conditional_dropout(person_poses, person_mask)
         x = torch.cat([x, ca_images, person_poses], dim=1)
         x = self.x_embedder(x)
         x, x_ids = prepare(x)
 
-        garment_poses = apply_conditional_dropout(garment_poses, mask)
-        garment_images = apply_conditional_dropout(garment_images, mask)
+        garment_poses = apply_conditional_dropout(garment_poses, garment_mask)
+        garment_images = apply_conditional_dropout(garment_images, garment_mask)
         garment_images = torch.cat([garment_images, garment_poses], dim=1)
         garment_images = self.garment_embedder(garment_images)
         garment_images, garment_ids = prepare(garment_images)
@@ -519,7 +568,7 @@ class TryOnModel(nn.Module):
 
         if exists(self.y_embedder):
             assert exists(garment_categories), "Category labels required for y_embedder"
-            y = apply_conditional_dropout(garment_categories, mask)
+            y = apply_conditional_dropout(garment_categories, garment_mask)
             t = t + self.y_embedder(y)
 
         ###################### POSITIONAL EMBEDDINGS ######################

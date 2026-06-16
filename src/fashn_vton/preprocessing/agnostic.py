@@ -111,42 +111,38 @@ def create_garment_image(
     return img_np
 
 
-def create_clothing_agnostic_image(
-    img_np: np.ndarray,
+def compute_clothing_agnostic_mask(
     seg_pred: np.ndarray,
     labels_to_segment_indices: List[int],
     body_coverage: str,
-    mask_value: int = 127,
-    disable_masking: bool = False,
     min_distance_threshold: float = 100.0,
     baseline_height: float = 864.0,
     mask_limbs: bool = True,
     logger: Optional[logging.Logger] = None,
 ) -> np.ndarray:
     """
-    Create clothing-agnostic image.
-
-    Masks garments and body parts based on the target category.
+    Compute the clothing-agnostic edit-region mask (the boolean mask that
+    `create_clothing_agnostic_image` paints gray). Exposed separately so callers
+    can know *which region the model is expected to change* even when masking
+    itself is disabled (e.g. segmentation-free mode) — useful for post-hoc
+    background/identity compositing.
 
     Args:
-        img_np: Input image array (will be modified in-place)
         seg_pred: Segmentation prediction array
         labels_to_segment_indices: List of label indices to mask
         body_coverage: Coverage type ("full", "upper", or "lower")
-        mask_value: Value to fill masked regions (default: 127 gray)
-        disable_masking: If True, return image unchanged
         min_distance_threshold: Distance threshold for hybrid mask (at baseline height)
         baseline_height: Reference height for parameter scaling
         mask_limbs: If True, also mask arms/legs based on body_coverage
         logger: Optional logger instance
 
     Returns:
-        Clothing-agnostic image array
+        Boolean mask, same H×W as seg_pred
     """
     logger = _default(logger, lambda: setup_logger("clothing_agnostic"))
 
-    if disable_masking:
-        return img_np
+    # Avoid mutating the caller's list
+    labels_to_segment_indices = list(labels_to_segment_indices)
 
     # Scale parameters based on image height
     height_scale = seg_pred.shape[0] / baseline_height
@@ -206,7 +202,53 @@ def create_clothing_agnostic_image(
         feet_mask = seg_pred == labels_ids_dict["feet"]
         exclusion_mask = exclusion_mask | feet_mask
 
-    final_mask = buffer_mask | (ca_mask & ~exclusion_mask)
+    return buffer_mask | (ca_mask & ~exclusion_mask)
+
+
+def create_clothing_agnostic_image(
+    img_np: np.ndarray,
+    seg_pred: np.ndarray,
+    labels_to_segment_indices: List[int],
+    body_coverage: str,
+    mask_value: int = 127,
+    disable_masking: bool = False,
+    min_distance_threshold: float = 100.0,
+    baseline_height: float = 864.0,
+    mask_limbs: bool = True,
+    logger: Optional[logging.Logger] = None,
+) -> np.ndarray:
+    """
+    Create clothing-agnostic image.
+
+    Masks garments and body parts based on the target category.
+
+    Args:
+        img_np: Input image array (will be modified in-place)
+        seg_pred: Segmentation prediction array
+        labels_to_segment_indices: List of label indices to mask
+        body_coverage: Coverage type ("full", "upper", or "lower")
+        mask_value: Value to fill masked regions (default: 127 gray)
+        disable_masking: If True, return image unchanged
+        min_distance_threshold: Distance threshold for hybrid mask (at baseline height)
+        baseline_height: Reference height for parameter scaling
+        mask_limbs: If True, also mask arms/legs based on body_coverage
+        logger: Optional logger instance
+
+    Returns:
+        Clothing-agnostic image array
+    """
+    if disable_masking:
+        return img_np
+
+    final_mask = compute_clothing_agnostic_mask(
+        seg_pred=seg_pred,
+        labels_to_segment_indices=labels_to_segment_indices,
+        body_coverage=body_coverage,
+        min_distance_threshold=min_distance_threshold,
+        baseline_height=baseline_height,
+        mask_limbs=mask_limbs,
+        logger=logger,
+    )
     img_np[final_mask] = mask_value
 
     return img_np
