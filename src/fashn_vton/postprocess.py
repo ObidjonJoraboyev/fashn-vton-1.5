@@ -213,6 +213,61 @@ def composite_preserve_background(
     return Image.fromarray(blended.clip(0, 255).astype(np.uint8))
 
 
+def harmonize_lighting(
+    image: Image.Image,
+    edit_mask: np.ndarray,
+    context_band_px: int = 24,
+    strength: float = 0.4,
+) -> Image.Image:
+    """
+    Nudge the lightness (L channel in LAB) inside `edit_mask` toward the
+    statistics of the band of pixels just outside it, so a garment shot under
+    different studio lighting than the person photo looks less "pasted on".
+
+    Only L is adjusted — A/B (color) channels are left untouched so the
+    garment's actual color/pattern (what fidelity depends on) isn't degraded.
+    `strength` keeps the correction partial; the boundary is feathered to
+    avoid a visible seam.
+
+    Args:
+        image: Generated (or composited) image
+        edit_mask: Boolean array marking the garment-affected region. Resized
+            to `image`'s resolution automatically if shapes don't match.
+        context_band_px: Width of the surrounding ring sampled as the lighting reference
+        strength: 0 = no change, 1 = fully match the context's lighting statistics
+
+    Returns:
+        Image with adjusted lightness inside the edit region
+    """
+    img_np = np.array(image.convert("RGB"))
+
+    if edit_mask.shape[:2] != img_np.shape[:2]:
+        edit_mask = cv2.resize(
+            edit_mask.astype(np.uint8), (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_NEAREST
+        ).astype(bool)
+
+    kernel = np.ones((context_band_px * 2 + 1, context_band_px * 2 + 1), np.uint8)
+    dilated = cv2.dilate(edit_mask.astype(np.uint8), kernel).astype(bool)
+    context_mask = dilated & ~edit_mask
+
+    if edit_mask.sum() < 50 or context_mask.sum() < 50:
+        return image
+
+    lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+    l_channel = lab[..., 0]
+
+    edit_mean, edit_std = l_channel[edit_mask].mean(), l_channel[edit_mask].std() + 1e-6
+    ctx_mean, ctx_std = l_channel[context_mask].mean(), l_channel[context_mask].std() + 1e-6
+
+    target_l = (l_channel - edit_mean) / edit_std * ctx_std + ctx_mean
+    alpha = _feather_mask(edit_mask, feather_px=max(1, context_band_px // 2)) * strength
+    blended_l = l_channel * (1 - alpha) + target_l * alpha
+
+    lab[..., 0] = np.clip(blended_l, 0, 255)
+    harmonized = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+    return Image.fromarray(harmonized)
+
+
 def unsharp_mask(image: Image.Image, amount: float = 0.6, radius: float = 1.5, threshold: int = 2) -> Image.Image:
     """
     Classic unsharp-mask sharpening to counter the mild softness typical of

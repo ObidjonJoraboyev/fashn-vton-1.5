@@ -2,8 +2,8 @@
 
 import logging
 import os
-from dataclasses import dataclass
-from typing import List, Literal, Optional
+from dataclasses import dataclass, field
+from typing import List, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -43,6 +43,13 @@ class PipelineOutput:
     # Garment-fidelity ranking scores, same order as `images` (best first).
     # Only populated when num_samples > 1; None for single-sample calls.
     scores: Optional[List[float]] = None
+    # Human-readable input/category warnings raised during this call, for a
+    # caller-facing UI to surface (e.g. "retake the photo") instead of digging
+    # through logs.
+    warnings: List[str] = field(default_factory=list)
+    # Garment-affected region for the final image, at its resolution. Lets
+    # callers do their own compositing (e.g. `run_outfit` protecting earlier passes).
+    edit_mask: Optional[np.ndarray] = None
 
 
 class TryOnPipeline:
@@ -106,13 +113,15 @@ class TryOnPipeline:
         category: str,
         min_confidence: float = 0.08,
         strict: bool = False,
-    ) -> None:
+    ) -> Optional[str]:
         """
         Sanity-check that the garment image actually looks like the requested category.
 
         Compares pixel coverage of each category's associated labels in the garment
         image's own segmentation and warns (or raises, if `strict`) when a different
         category is clearly more dominant than the one requested.
+
+        Returns the warning message (also logged), or None if no mismatch found.
         """
         coverage_by_category = {}
         for candidate in self.CATEGORY_TO_LABEL:
@@ -121,13 +130,13 @@ class TryOnPipeline:
                 coverage_by_category[candidate] = float(np.isin(garment_seg_pred, indices).mean())
 
         if not coverage_by_category:
-            return
+            return None
 
         best_category = max(coverage_by_category, key=coverage_by_category.get)
         best_coverage = coverage_by_category[best_category]
 
         if best_coverage < min_confidence or best_category == category:
-            return
+            return None
 
         msg = (
             f"Garment image looks like '{best_category}' ({best_coverage:.0%} of pixels match) "
@@ -137,6 +146,7 @@ class TryOnPipeline:
         if strict:
             raise ValueError(msg)
         self.logger.warning(msg)
+        return msg
 
     def _validate_inputs(
         self,
@@ -147,19 +157,25 @@ class TryOnPipeline:
         min_resolution: int = 256,
         min_keypoints: int = 8,
         strict: bool = False,
-    ) -> None:
+    ) -> List[str]:
         """
         Catch garbage-in-garbage-out cases before spending a full sampling pass:
         too-low resolution, no detectable person, or a photo that doesn't actually
         show the body region the requested category needs (e.g. a half-body crop
         with category="bottoms").
+
+        Returns the list of warning messages found (also logged).
         """
+        warnings: List[str] = []
+
         h, w = person_image_np.shape[:2]
         if min(h, w) < min_resolution:
-            self.logger.warning(
+            msg = (
                 f"person_image is low resolution ({w}x{h}); results may be degraded. "
                 f"Recommended minimum: {min_resolution}px on the shorter side."
             )
+            self.logger.warning(msg)
+            warnings.append(msg)
 
         subset = person_pose["bodies"]["subset"]
         visible_keypoints = int(np.sum(subset[:, :18] != -1))
@@ -168,11 +184,14 @@ class TryOnPipeline:
             if strict:
                 raise ValueError(msg)
             self.logger.warning(msg)
+            warnings.append(msg)
         elif visible_keypoints < min_keypoints:
-            self.logger.warning(
+            msg = (
                 f"Low pose confidence: only {visible_keypoints}/18 body keypoints detected. "
                 "Use a clearer, front-facing, well-lit, single-person photo for best results."
             )
+            self.logger.warning(msg)
+            warnings.append(msg)
 
         body_coverage = CATEGORY_TO_BODY_COVERAGE.get(category)
         required_labels = {
@@ -194,6 +213,9 @@ class TryOnPipeline:
                 if strict:
                     raise ValueError(msg)
                 self.logger.warning(msg)
+                warnings.append(msg)
+
+        return warnings
 
     def _validate_weights(self):
         """Check that required weight files exist."""
@@ -352,6 +374,7 @@ class TryOnPipeline:
         restore_resolution: bool = True,
         sharpen: bool = True,
         restore_faces: bool = False,
+        harmonize_lighting: bool = True,
     ) -> PipelineOutput:
         """
         Run virtual try-on inference.
@@ -406,10 +429,17 @@ class TryOnPipeline:
                 when preserve_background=True since the face is already restored to
                 the exact original pixels during compositing. Mainly useful with
                 preserve_background=False.
+            harmonize_lighting: If True, nudge the generated garment region's
+                lightness toward the surrounding context (cheap, no new dependency)
+                so a garment shot under different studio lighting than the person
+                photo looks less "pasted on". Only lightness is adjusted, not color,
+                to avoid degrading garment-color fidelity.
 
         Returns:
-            PipelineOutput with `images` list containing generated PIL Images, and
-            `scores` (garment-fidelity ranking) when num_samples > 1.
+            PipelineOutput with `images` list containing generated PIL Images,
+            `scores` (garment-fidelity ranking) when num_samples > 1, `warnings`
+            (any input/category issues found), and `edit_mask` (the garment-affected
+            region, at the output image's resolution).
         """
         # Set seed
         torch.manual_seed(seed)
@@ -440,12 +470,17 @@ class TryOnPipeline:
         person_seg_pred = self.hp_model.predict(person_image_np)
         garment_seg_pred = self.hp_model.predict(garment_image_np)
 
+        warnings: List[str] = []
         if validate_inputs:
-            self._validate_inputs(
-                person_image_np, person_pose, person_seg_pred, category, strict=strict_validation
+            warnings.extend(
+                self._validate_inputs(
+                    person_image_np, person_pose, person_seg_pred, category, strict=strict_validation
+                )
             )
         if check_category_match:
-            self._check_category_match(garment_seg_pred, category, strict=strict_category_check)
+            category_warning = self._check_category_match(garment_seg_pred, category, strict=strict_category_check)
+            if category_warning:
+                warnings.append(category_warning)
 
         # Get labels to segment based on category
         body_coverage = CATEGORY_TO_BODY_COVERAGE.get(category)
@@ -538,6 +573,10 @@ class TryOnPipeline:
         elif restore_resolution:
             images = [postprocess.resize_to_match(img, original_person_image.size) for img in images]
 
+        # Nudge the garment region's lighting toward its surroundings (color untouched)
+        if harmonize_lighting:
+            images = [postprocess.harmonize_lighting(img, edit_mask) for img in images]
+
         # Sharpen only the model-generated content; re-composite so any protected
         # background pixels stay exactly as they were even after sharpening.
         if sharpen:
@@ -567,6 +606,83 @@ class TryOnPipeline:
             images = [images[i] for i in order]
             scores = [scores[i] for i in order]
 
+        # Resize edit_mask to the final output resolution so callers (e.g.
+        # run_outfit) can use it directly against the returned images.
+        output_size = images[0].size if images else original_person_image.size
+        edit_mask_out = cv2.resize(
+            edit_mask.astype(np.uint8), output_size, interpolation=cv2.INTER_NEAREST
+        ).astype(bool)
+
         self.logger.info(f"Generated {len(images)} images")
 
-        return PipelineOutput(images=images, scores=scores)
+        return PipelineOutput(images=images, scores=scores, warnings=warnings, edit_mask=edit_mask_out)
+
+    def run_outfit(
+        self,
+        person_image: Image.Image,
+        garments: List[Tuple[Image.Image, Literal["tops", "bottoms", "one-pieces"], Literal["model", "flat-lay"]]],
+        **kwargs,
+    ) -> PipelineOutput:
+        """
+        Apply multiple garments sequentially onto the same person (e.g. a top, then
+        a bottom, for a full outfit in one logical call).
+
+        Each pass regenerates the *entire* canvas from noise — it's not inpainting —
+        so without protection a later pass could subtly drift an earlier pass's
+        already-correct garment region. This method explicitly re-composites each
+        earlier pass's edit region back in after every subsequent pass, on top of
+        whatever `preserve_background` already does for the background/identity.
+        In practice the per-category masks (e.g. "upper" excludes legs, "lower"
+        excludes arms) are already mostly disjoint, so this is a safety net more
+        than something that fires constantly.
+
+        Args:
+            person_image: RGB image of the person to dress.
+            garments: (garment_image, category, garment_photo_type) tuples, applied
+                in order. E.g. [(top_img, "tops", "model"), (bottom_img, "bottoms", "flat-lay")].
+            **kwargs: Forwarded to every underlying `__call__` (num_samples is
+                forced to 1 per pass — ranking/sample-selection isn't meaningful
+                mid-sequence; preserve_background defaults to True if unset).
+
+        Returns:
+            PipelineOutput for the final composed image: `scores` are from the last
+            pass, `warnings` are concatenated across all passes, and `edit_mask`
+            covers the union of every pass's edit region.
+        """
+        if not garments:
+            raise ValueError("garments must contain at least one (garment_image, category, garment_photo_type) tuple")
+
+        kwargs = dict(kwargs)
+        kwargs["num_samples"] = 1
+        kwargs.setdefault("preserve_background", True)
+
+        current_image = person_image.convert("RGB")
+        protected_mask: Optional[np.ndarray] = None
+        all_warnings: List[str] = []
+        last_scores = None
+
+        for garment_image, category, garment_photo_type in garments:
+            result = self(
+                person_image=current_image,
+                garment_image=garment_image,
+                category=category,
+                garment_photo_type=garment_photo_type,
+                **kwargs,
+            )
+            new_image = result.images[0]
+            all_warnings.extend(result.warnings)
+            last_scores = result.scores
+
+            if protected_mask is not None:
+                # Force the already-finalized region back from the previous pass;
+                # keep this pass's fresh edit elsewhere.
+                new_image = postprocess.composite_preserve_background(
+                    generated=current_image, original=new_image, edit_mask=protected_mask
+                )
+
+            current_image = new_image
+            protected_mask = result.edit_mask if protected_mask is None else (protected_mask | result.edit_mask)
+
+        return PipelineOutput(
+            images=[current_image], scores=last_scores, warnings=all_warnings, edit_mask=protected_mask
+        )
