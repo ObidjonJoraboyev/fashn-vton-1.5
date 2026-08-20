@@ -1,3 +1,23 @@
+> ### ⚠️ Attribution
+>
+> **This is not my model.** The base model, weights, and the original README below are the work of
+> [**FASHN AI**](https://fashn.ai) — released under Apache-2.0 at
+> [`fashn-ai/fashn-vton-1.5`](https://huggingface.co/fashn-ai/fashn-vton-1.5).
+> This repository is a snapshot of their inference code that I extended for my own experiments.
+>
+> **My contributions on top of the original:**
+> - **Output-quality pipeline** — input validation, background compositing, optional super-resolution
+>   and face-identity preservation, and decoupled classifier-free guidance.
+> - **Outfit composer** — multi-garment composition in a single pass.
+> - **Lighting harmonization** — matches garment lighting to the source photo to remove the
+>   "pasted-on" look.
+> - **Structured warnings** — actionable diagnostics instead of silent low-quality output.
+>
+> See the commit history for the exact diff against the upstream snapshot.
+> Everything below this line is FASHN AI's original documentation.
+
+---
+
 # FASHN VTON v1.5: Efficient Maskless Virtual Try-On in Pixel Space
 
 <div align="center">
